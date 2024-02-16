@@ -75,7 +75,7 @@ experiments
 ├── prediction_intervals
 │   ├── biomass_example.py		    # Run biomass experiment
 │   ├── analyze_results_biomass.py	    # Generate plots after running biomass experiment
-│   ├── abalone_example.py		    # Run biomass experimetn
+│   ├── abalone_example.py		    # Run biomass experiment
 │   └── analyze_results_abalone.py          # Generate plots after running abalone experiment
 |
 ├── simulation_experiment
