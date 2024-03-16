@@ -4,6 +4,11 @@ import argparse
 import os
 import pickle
 from quantile_forest import RandomForestQuantileRegressor
+from sklearn.preprocessing import StandardScaler
+from experiments.helpers.cp_methods import (cqr_QuantileForest,
+                                            cqr_QuantileNN,
+                                            QuantileNN,
+                                            quantile_cross_validation)
 from xtrapolation.xtrapolation import Xtrapolation
 
 
@@ -18,14 +23,17 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("-s", "--split", type=int,
                     help="number of split to run")
+parser.add_argument("-m", "--method",
+                    help="quantile regression method")
 parser.add_argument("-r", "--runname",
-                    help="name for of experiment")
+                    help="name for experiment")
 args = parser.parse_args()
 config = vars(args)
 print(config)
 
 runname = config['runname']
 split = config['split']
+method = config['method']
 
 
 # set output path
@@ -68,10 +76,10 @@ parameters = {'orders': [1],
                   'num_trees': 200,
                   'smoothed_predictions': False,
                   'pen': 0,
-                  'penalize_intercept': False
+                  'penalize_intercept': True
               },
               'extra_params': {
-                  'nn': 50,
+                  'nn': 100,
                   'dist': 'rfnn',
                   'rf_pars': {},
                   'num_trees': 200,
@@ -82,13 +90,12 @@ parameters = {'orders': [1],
 
 # CV parameter grids
 rf_pars_list = [
-    {'max_depth': 1},
-    {'max_depth': 2},
-    {'max_depth': 3},
-    {'max_depth': 4},
+    {'min_samples_leaf': 10},
+    {'min_samples_leaf': 5},
+    {}
 ]
 
-pen_list = [1, 0.1, 0.01, 0]
+pen_list = [0.1, 0.01, 0.001]
 
 
 # Tuning parameters wrapper function
@@ -101,7 +108,7 @@ def tuning_wrapper_fun(X, qmat, y):
             X, (qmat[:, 0] + qmat[:, 1])/2, y,
             no_xtra_features,
             rf_pars_list, pen_list,
-            loss="quantile", q=qq, tol=3)
+            loss="quantile", q=qq, tol=1)
         print(f'quantile {qq}:')
         print(rf_pars[i])
         print(pens[i])
@@ -112,15 +119,61 @@ def tuning_wrapper_fun(X, qmat, y):
 # Multiple train-test splits
 ##
 
-def train_test_split(train_ind):
+def train_test_split(train_ind, method):
     Xtrain = X[train_ind, :]
     ytrain = y[train_ind]
 
-    # Run quantile regression (with forests)
-    qrf = RandomForestQuantileRegressor(n_estimators=2000,
-                                        max_depth=5)
-    qrf.fit(Xtrain, ytrain)
-    qmat = qrf.predict(X, quantiles=quantiles)
+    # Scaling (mean and variance)
+    std_scale = StandardScaler()
+    std_scale.fit(Xtrain)
+    Xtrain = std_scale.transform(Xtrain)
+    Xscaled = std_scale.transform(X, copy=True)
+
+    if method == "qrf":
+        # Run quantile regression (with forests)
+        opt_params = quantile_cross_validation(Xtrain, ytrain, quantiles,
+                                               "qrf", n_folds=5)
+        opt_params['n_estimators'] = 2000
+        print(opt_params)
+        qrf = RandomForestQuantileRegressor(**opt_params)
+        qrf.fit(Xtrain, ytrain)
+        qmat = qrf.predict(Xscaled, quantiles=quantiles)
+    elif method == "conf-qrf":
+        # Run conformalized quantile regression (with forests)
+        idx = np.random.permutation(Xtrain.shape[0])
+        n_half = int(np.floor(Xtrain.shape[0]/2))
+        idx_train, idx_cal = (idx[:n_half], idx[n_half:2*n_half])
+        opt_params = quantile_cross_validation(
+            Xtrain[idx_train, :], ytrain[idx_train], quantiles,
+            "conf-qrf", n_folds=5, tol=1)
+        opt_params['n_estimators'] = 2000
+        print(opt_params)
+        qmat = cqr_QuantileForest(Xtrain, ytrain,
+                                  Xscaled, quantiles,
+                                  opt_params, (idx_train, idx_cal))
+    elif method == "qnn":
+        # Run quantile regression (with neural nets)
+        opt_params = quantile_cross_validation(Xtrain, ytrain, quantiles,
+                                               "qnn", n_folds=5, tol=1)
+        opt_params['batch_size'] = 64
+        opt_params['epochs'] = 1000
+        print(opt_params)
+        qmat = QuantileNN(Xtrain, ytrain,
+                          Xscaled, quantiles, opt_params)
+    elif method == "conf-qnn":
+        # Run conformalized quantile regression (with neural nets)
+        idx = np.random.permutation(Xtrain.shape[0])
+        n_half = int(np.floor(Xtrain.shape[0]/2))
+        idx_train, idx_cal = (idx[:n_half], idx[n_half:2*n_half])
+        opt_params = quantile_cross_validation(
+            Xtrain[idx_train, :], ytrain[idx_train], quantiles,
+            "conf-qnn", n_folds=5, tol=1)
+        opt_params['batch_size'] = 64
+        opt_params['epochs'] = 1000
+        print(opt_params)
+        qmat = cqr_QuantileNN(Xtrain, ytrain,
+                              Xscaled, quantiles,
+                              opt_params, (idx_train, idx_cal))
 
     # Run parameter tuning
     rf_pars, pens = tuning_wrapper_fun(
@@ -135,7 +188,7 @@ def train_test_split(train_ind):
         xtra = Xtrapolation(**parameters)
         print(f"Working on quantile {qq}")
         bounds_list[i] = xtra.prediction_bounds(
-            Xtrain, qmat[train_ind, i], X,
+            Xtrain, qmat[train_ind, i], Xscaled,
             no_xtra_features,
             refit=True)
 
@@ -175,7 +228,7 @@ train_inds += [(randX <= thresholds[k]) | (thresholds[k+1] < randX)
 # Run experiment
 ##
 
-res = train_test_split(train_inds[split])
+res = train_test_split(train_inds[split], method)
 
 # Save results
 results_dict = {
@@ -183,5 +236,5 @@ results_dict = {
     'parameters': parameters
 }
 
-with open(output_path + f'abalone_{runname}_{split}.pkl', 'wb') as f:
+with open(output_path + f'abalone_{runname}_{method}_{split}.pkl', 'wb') as f:
     pickle.dump(results_dict, f)
