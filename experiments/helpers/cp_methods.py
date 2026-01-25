@@ -16,7 +16,7 @@ def cqr_QuantileForest(Xtrain, ytrain, Xtest, quantiles, params, idx=None):
     # Compute level
     alpha = 1 - (quantiles[1] - quantiles[0])
 
-    n_train, d = Xtrain.shape
+    n_train, _ = Xtrain.shape
 
     # Data splitting
     if idx is None:
@@ -58,7 +58,7 @@ def cqr_QuantileForest(Xtrain, ytrain, Xtest, quantiles, params, idx=None):
 
 # QuantileNN wrapper
 def QuantileNN(Xtrain, ytrain, Xtest, quantiles, params):
-    n_train, d = Xtrain.shape
+    _, d = Xtrain.shape
 
     # define QRF model
     quantile_estimator = helper.AllQNet_RegressorAdapter(
@@ -137,8 +137,8 @@ def cqr_QuantileNN(Xtrain, ytrain, Xtest, quantiles, params, idx=None):
 ###
 
 
-def quantile_cross_validation(X, y, quantiles, method, n_folds=3, tol=1):
-    n, d = X.shape
+def quantile_cross_validation(X, y, quantiles, method, n_folds=3, tol=1.0):
+    n, _ = X.shape
     kf = KFold(n_splits=n_folds, shuffle=True)
     if method == 'qrf':
         par_grid = [1, 5, 10, 20, 40, 80, 160]
@@ -271,5 +271,7 @@ def quantile_cross_validation(X, y, quantiles, method, n_folds=3, tol=1):
                       'epochs': 1000,
                       'weight_decay': wds[ind_x],
                       'hidden_size': hiddens[ind_y]}
+    else:
+        raise ValueError(f"method {method} does not exist")
 
     return opt_params

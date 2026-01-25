@@ -27,7 +27,7 @@ To reproduce the real-data experiments [pytorch](https://pytorch.org/)
 needs to be installed as well as it is used to train the quantile
 neural networks.
 
-The following code snippet provides a minimal working example how to
+The following code snippet provides a minimal working example on how to
 use Xtrapolation to estimate extrapolation bounds.
 
 ```python
@@ -76,24 +76,24 @@ The code is structured as follows.
 ```
 experiments
 ├── prediction_intervals
-│   ├── biomass_example.py		    # Run biomass experiment
-│   ├── analyze_results_biomass.py	    # Generate plots after running biomass experiment
-│   ├── abalone_example.py		    # Run abalone experiment
-│   └── analyze_results_abalone.py          # Generate plots after running abalone experiment
+│   ├── biomass.py		          # Run biomass experiment
+│   ├── analyze_biomass.py	    # Generate plots after running biomass experiment
+│   ├── abalone.py		          # Run abalone experiment
+│   └── analyze_abalone.py      # Generate plots after running abalone experiment
 │
 ├── simulation_experiment
-│   ├── simulation_experiment.py	    # Run single seed of simulation experiment
+│   ├── simulation_experiment.py	          # Run single seed of simulation experiment
 │   └── analyze_simulation_experiments.py   # Generate plots after running all seeds/settings
 │
 ├── visualization
-│   ├── linear_vs_xtrapolation.py	    # Reproduce Figure 2
+│   ├── linear_vs_xtrapolation.py	          # Reproduce Figure 2 and Appendix B.1
 │   └── visualizing_extrapolation_bounds.py # Reproduce Figure 1
 │
 ├── helpers
-│   ├── examples.py			    # Example functions used in code
+│   ├── examples.py			              # Example functions used in code
 │   ├── regression_methods.py 		    # Sklearn regression piplines
-│   ├── cp_methods.py 		    	    # Functions used to fit quantile regressions
-│   └── conformal 		    	    # Folder with external code for conformalized methods
+│   ├── cp_methods.py 		    	      # Functions used to fit quantile regressions
+│   └── conformal 		    	          # Folder with external code for conformalized methods
 │
 └── results				    # Folder in which results are saved
 ```

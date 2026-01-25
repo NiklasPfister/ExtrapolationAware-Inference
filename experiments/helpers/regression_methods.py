@@ -41,7 +41,7 @@ def rf_regression(X, Y, param_grid=None, rf_screen=False):
     if param_grid is None:
         param_grid = [
             {'n_estimators': [500],
-             'max_depth': [1, 2, 4, 8, 16, sys.maxsize]}
+             'min_samples_leaf': [128, 64, 32, 16, 8, 4, 2, 1]}
         ]
     rf = RandomForestRegressor()
     rf_cv = GridSearchCV(rf, param_grid,

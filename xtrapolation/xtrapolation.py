@@ -1,605 +1,714 @@
-import numpy as np
-import copy
+"""
+Xtrapolation: Extrapolation-Aware Nonparametric Statistical Inference
+
+Based on Pfister & Bühlmann (2024) - "Extrapolation-Aware Nonparametric Statistical Inference"
+
+This module provides tools for computing extrapolation bounds on conditional functions
+using Taylor's theorem and random forest-based derivative estimation.
+"""
+
 import math
-from xtrapolation.helpers import rf_weights_adaXT
-from xtrapolation.helpers import (penalized_locpol, locpol_predict, Dv)
+from typing import Callable, Literal
+
+import numpy as np
 from sklearn.model_selection import KFold
+import time
+
+from xtrapolation.helpers import (
+    DerivativeConfig,
+    ExtrapolationConfig,
+    get_feature_indices,
+    aggregate_bounds,
+    compute_anchor_weights,
+    transform_features_by_gradient,
+    apply_feature_transform,
+    rf_weights_adaXT,
+    fit_derivatives_adaXT,
+    penalized_locpol,
+    locpol_predict,
+    Dv,
+)
 
 
 class Xtrapolation:
-    """Xtrapolation class
-
     """
-    # Initialize Xtrapolation
+    Xtrapolation: Extrapolation-Aware Nonparametric Statistical Inference.
+
+    Computes extrapolation bounds on conditional functions using Taylor's theorem
+    and random forest-based derivative estimation.
+
+    Args:
+        orders: Array of derivative orders to compute bounds for (default: [1])
+        deriv_config: Configuration for derivative estimation
+        extra_config: Configuration for extrapolation bounds
+        verbose: Verbosity level (0=silent, 1=progress, 2+=debug)
+    """
 
     def __init__(
-            self,
-            orders=np.array([1]),
-            deriv_params={},
-            extra_params={},
-            verbose=1
+        self,
+        orders: list[int] | None = None,
+        deriv_config: DerivativeConfig | None = None,
+        extra_config: ExtrapolationConfig | None = None,
+        verbose: int = 0,
     ):
-        # Set defaults for deriv_params
-        self.deriv_params_ = copy.deepcopy(deriv_params)
-        if 'rf_pars' not in deriv_params:
-            self.deriv_params_['rf_pars'] = {}
-        if 'num_rotate' not in deriv_params:
-            self.deriv_params_['num_rotate'] = 0
-        if 'num_trees' not in deriv_params:
-            self.deriv_params_['num_trees'] = 200
-        if 'smoothed_predictions' not in deriv_params:
-            self.deriv_params_['smoothed_predictions'] = False
-        if 'pen' not in deriv_params:
-            self.deriv_params_['pen'] = 0
-        if 'penalize_intercept' not in deriv_params:
-            self.deriv_params_['penalize_intercept'] = False
-        # Set defaults for exra_params
-        self.extra_params_ = copy.deepcopy(extra_params)
-        if 'nn' not in extra_params:
-            self.extra_params_['nn'] = 1
-        if 'dist' not in extra_params:
-            self.extra_params_['dist'] = 'rf'
-        if 'num_trees' not in extra_params:
-            self.extra_params_['num_trees'] = 200
-        if 'alpha' not in extra_params:
-            self.extra_params_['alpha'] = 0
-        if 'beta' not in extra_params:
-            self.extra_params_['beta'] = 0
-        if 'aggregation' not in extra_params:
-            self.extra_params_['aggregation'] = 'optimal-average'
-        if 'rf_pars' not in extra_params:
-            self.extra_params_['rf_pars'] = {}
+        self.orders = np.array([1]) if orders is None else np.asarray(orders)
+        self.deriv_config = deriv_config or DerivativeConfig()
+        self.extra_config = extra_config or ExtrapolationConfig()
+        self.verbose = verbose
 
-        # Initialize remaining parameters
-        self.orders_ = copy.deepcopy(orders)
-        self.verbose_ = copy.deepcopy(verbose)
+        # Cache computed values
+        self._max_order = int(np.max(self.orders))
+        self._factorials = np.array(
+            [math.factorial(k) for k in range(self._max_order + 1)]
+        )
 
-        # Initialize output variables
-        self.weights_ = None
-        self.predict_weights_ = None
-        self.derivatives_ = None
+        # Fitted attributes (set during fit/predict)
+        self.weights_: list[np.ndarray] | None = None
+        self.predict_weights_: np.ndarray | None = None
+        self.derivatives_: np.ndarray | list[np.ndarray] | None = None
 
-        # Initialize internal variables
-        self._max_order = np.max(orders)
+    # -------------------------------------------------------------------------
+    # Random Forest Weight Fitting
+    # -------------------------------------------------------------------------
 
-    # Compute random forest weights
-    def fit_rfweights(self, X, fval, no_xtra_features=None):
+    def fit_rfweights(
+        self,
+        X: np.ndarray,
+        fval: np.ndarray,
+        no_xtra_features: list | None = None,
+        Xeval: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """
+        Fit random forest weights for derivative estimation.
+
+        Args:
+            X: Feature matrix of shape (n, d)
+            fval: Function values of shape (n,)
+            no_xtra_features: Features to exclude from extrapolation
+
+        Returns:
+            List of weight matrices, one per extrapolation feature
+        """
+        _, d = X.shape
+        fval = fval.flatten()
+        xtra_features, _ = get_feature_indices(d, no_xtra_features)
+
+        weights = []
+        for var in xtra_features:
+            # Reorder features to put current variable first
+            var_order = np.array([var] + [i for i in range(d) if i != var])
+
+            if self.verbose > 1:
+                print(f"Fitting RF weights for coordinate {var}")
+
+            weights.append(
+                rf_weights_adaXT(
+                    X[:, var_order],
+                    fval,
+                    Xeval=Xeval,
+                    rf_pars=self.deriv_config.rf_pars,
+                    num_trees=self.deriv_config.num_trees,
+                    criteria=self.deriv_config.criteria,
+                )
+            )
+
+        return weights
+
+    # -------------------------------------------------------------------------
+    # Derivative Estimation
+    # -------------------------------------------------------------------------
+
+    def fit_derivatives(
+        self,
+        X: np.ndarray,
+        fval: np.ndarray,
+        no_xtra_features: list | None = None,
+        refit: bool = False,
+    ) -> np.ndarray:
+        """
+        Estimate derivatives using local polynomials or adaXT.
+
+        Args:
+            X: Feature matrix of shape (n, d)
+            fval: Function values of shape (n,)
+            no_xtra_features: Features to exclude
+            refit: Whether to refit even if already fitted
+
+        Returns:
+            Derivatives array of shape (max_order+1, n, d_xtra)
+        """
         n, d = X.shape
         fval = fval.flatten()
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-            d_xtra = len(xtra_features)
-        else:
-            d_xtra = d
-            xtra_features = list(range(d))
-        weights = [None]*d_xtra
+        xtra_features, no_xtra_list = get_feature_indices(d, no_xtra_features)
+        if self.verbose > 2:
+            print("DEBUG:")
+            print(f"Extrapolation features: {xtra_features}")
+            print(f"Excluded features: {no_xtra_list}")
+        d_xtra = len(xtra_features)
 
-        # Compute weights for derivative estimation (only on xtra_features)
-        for jj, var in enumerate(xtra_features):
-            var_order = list(range(d))
-            var_order = np.array([var] + var_order[:var]
-                                 + var_order[var+1:])
-            if self.verbose_ > 1:
-                print(f"Fitting RF wrt to {var}. coordinate")
-                print(var_order)
-            weights[jj] = rf_weights_adaXT(
-                X[:, var_order], fval,
-                rf_pars=self.deriv_params_['rf_pars'],
-                num_trees=self.deriv_params_['num_trees'],
-                criteria="Linear_regression",
-                verbose=self.verbose_ - 2)
-        # Collect output
-        self.weights_ = weights
-
-    def fit_rfweights_predict(self, X, fval, x0):
-        n, d = X.shape
-        n0, _ = x0.shape
-        fval = fval.flatten()
-
-        if self.verbose_ > 1:
-            print("Fitting weights for extrapolation points...")
-        predict_weights = rf_weights_adaXT(
-            X, fval, x0,
-            rf_pars=self.extra_params_['rf_pars'],
-            num_trees=self.extra_params_['num_trees'],
-            criteria="Squared_error",
-            verbose=self.verbose_ - 2)
-        self.predict_weights_ = predict_weights[n:, :n]
-
-    # Function to tune rf_pars and pen parameters
-    def parameter_tuning(self, X, fval, Y,
-                         no_xtra_features=None,
-                         rf_pars_list=None, pen_list=None,
-                         loss="mse", q=None, tol=3):
-        n = X.shape[0]
-        d = X.shape[1]
-        eps = np.finfo(float).eps
-        if rf_pars_list is None:
-            rf_pars_list = [self.deriv_params_['rf_pars']]
-        if pen_list is None:
-            pen_list = [self.deriv_params_['pen']]
-        N1 = len(rf_pars_list)
-        N2 = len(pen_list)
-
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-            d_xtra = len(xtra_features)
-        else:
-            xtra_features = list(range(d))
-            d_xtra = d
-
-        # Tuning of parameters derivative estimation (rf_pars and pen)
-        if N1 > 1 or N2 > 1:
-            kf = KFold(n_splits=5, shuffle=True)
-            err_mat = np.zeros((n, N1, N2))
-            for i, rf_pars in enumerate(rf_pars_list):
-                self.deriv_params_['rf_pars'] = rf_pars
-                self.fit_rfweights(X, fval, no_xtra_features)
-                for j, pen in enumerate(pen_list):
-                    self.deriv_params_['pen'] = pen
-                    fhat = np.zeros(n)
-                    degree = self._max_order+1
-                    # Compute predictions using CV and locpol predictions
-                    for (train, test) in kf.split(X):
-                        for ll, var in enumerate(xtra_features):
-                            vv = np.zeros((d, 1))
-                            vv[var] = 1
-                            weights = self.weights_[ll][:, train]
-                            weights /= weights.sum(axis=1)[:, None]
-                            deriv_mat = penalized_locpol(
-                                fval[train], vv, X[train, :],
-                                weights[train, :],
-                                degree=degree,
-                                pen=self.deriv_params_['pen'],
-                                penalize_intercept=self.deriv_params_[
-                                    'penalize_intercept'])
-                            coefs = deriv_mat / np.array(
-                                [math.factorial(k)
-                                 for k in range(degree+1)])
-                            fhat[test] += locpol_predict(
-                                coefs, weights[test, :],
-                                X[train, :], X[test, :],
-                                vv, degree)/d_xtra
-                    # Select loss
-                    if loss == "quantile":
-                        err_mat[:, i, j] = (q * np.abs(fhat - Y) * (Y > fhat) +
-                                            (1-q) * np.abs(
-                                                fhat - Y) * (Y <= fhat))
-                    elif loss == "mse":
-                        err_mat[:, i, j] = (fhat - Y) ** 2
-            # Select optimal rf_pars
-            mean_mat = err_mat.mean(axis=0)
-            min_ind = np.where(mean_mat == mean_mat.min())
-            ind_x = min_ind[0][0]
-            ind_y = min_ind[1][0]
-            var_mat = np.var(
-                err_mat - err_mat[:, ind_x, ind_y][:, None, None],
-                axis=0)
-            se_mat = np.sqrt(var_mat)/np.sqrt(n)
-            bx, by = np.where(
-                mean_mat <= mean_mat[ind_x, ind_y] + tol * se_mat + eps)
-            ind1 = np.min(bx)
-            ind2 = np.min(by[bx == ind1])
-            opt_rf_pars = rf_pars_list[ind1]
-            opt_pen = pen_list[ind2]
-            # print results
-            if self.verbose_ > 0:
-                print(mean_mat)
-                print(se_mat)
-        else:
-            opt_rf_pars = rf_pars_list[0]
-            opt_pen = pen_list[0]
-        # Set optimal parameters
-        self.deriv_params_['rf_pars'] = opt_rf_pars
-        self.deriv_params_['pen'] = opt_pen
-
-        return opt_rf_pars, opt_pen
-
-    # Estimate derivatives
-    def fit_derivatives(self, X, fval,
-                        no_xtra_features=None, refit=False):
-        n, d = X.shape
-        fval = fval.flatten()
-
-        # Handle no_xtra_features
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-            d_xtra = len(xtra_features)
-        else:
-            d_xtra = d
-            xtra_features = list(range(d))
-            no_xtra_features = []
-
-        # Can only compute higher orders if d == 1
-        if (self._max_order > 1) & (d > 1):
+        # Higher-order derivatives only supported for 1D
+        if self._max_order > 1 and d > 1:
             raise ValueError(
-                "Current implimentation only allows \
-                higher-order derivatives for X.shape[1] == 1.")
+                "Higher-order derivatives (order > 1) only supported for 1D data"
+            )
 
-        # Check if weights are computed
-        if self.weights_ is None or refit:
-            if self.verbose_ > 0:
-                print("Fitting weights for local polynomial...")
-            self.fit_rfweights(X, fval, no_xtra_features)
+        # Fit weights if needed (for no-locpol method)
+        if not self.deriv_config.no_locpol:
+            if self.weights_ is None or refit:
+                if self.verbose > 0:
+                    print("Fitting weights for local polynomial...")
+                self.weights_ = self.fit_rfweights(X, fval, no_xtra_features)
 
-        # Estimate derivatives with local polynomial
+        # Initialize derivatives array
         derivatives = np.zeros((self._max_order + 1, n, d_xtra))
-        Xtilde = X[:, xtra_features]
-        for ll in range(self.deriv_params_['num_rotate'] + 1):
-            # Rotate and refit weights
-            if ll > 0:
+        X_work = X[:, xtra_features]
+
+        # Optionally rotate features based on gradient directions
+        Vt = None
+        for rotation in range(self.deriv_config.num_rotate + 1):
+            if rotation > 0:
                 mu = derivatives[1].mean(axis=0)
-                Vt = np.linalg.svd(derivatives[1]-mu[None, :])[2]
-                Xtilde = X[:, xtra_features].dot(Vt.T)
-                self.fit_rfweights(
-                    np.c_[Xtilde, X[:, no_xtra_features]],
-                    fval, no_xtra_features=list(range(d_xtra, d)))
-            # Fit local polynomial
-            for jj in range(d_xtra):
-                vv = np.zeros((d_xtra, 1))
-                vv[jj] = 1
-                tmp = penalized_locpol(fval, vv,
-                                       Xtilde,
-                                       self.weights_[jj],
-                                       degree=self._max_order+1,
-                                       pen=self.deriv_params_['pen'],
-                                       penalize_intercept=self.deriv_params_[
-                                           'penalize_intercept'])
-                for kk in range(self._max_order + 1):
-                    if (kk == 0 and not
-                        self.deriv_params_['smoothed_predictions']):
-                        derivatives[kk, :, jj] = fval
+                Vt = np.linalg.svd(derivatives[1] - mu[None, :])[2]
+                X_work = X[:, xtra_features] @ Vt.T
+
+                if not self.deriv_config.no_locpol:
+                    X_full = np.c_[X_work, X[:, no_xtra_list]]
+                    self.weights_ = self.fit_rfweights(
+                        X_full, fval, no_xtra_features=list(range(d_xtra, d))
+                    )
+
+            # Fit derivatives for each direction
+            for j in range(d_xtra):
+                direction = np.zeros((d_xtra, 1))
+                direction[j] = 1
+
+                if self.deriv_config.no_locpol:
+                    dfeature = xtra_features[j]
+                    xtra_order = [dfeature] + [
+                        k for k in xtra_features if k != dfeature
+                    ]
+
+                    # Minimize memory copies: use column_stack only when necessary
+                    xtra_cols = X[:, xtra_order]
+                    if no_xtra_list:
+                        X_full = np.column_stack([xtra_cols, X[:, no_xtra_list]])
                     else:
-                        derivatives[kk, :, jj] = tmp[:, kk]
+                        X_full = xtra_cols
+
+                    if self.verbose > 1:
+                        print(f"Coordinate {dfeature}")
+
+                    deriv_estimates = fit_derivatives_adaXT(
+                        X=X_full,
+                        Y=fval,
+                        rf_pars=self.deriv_config.rf_pars,
+                        num_trees=self.deriv_config.num_trees,
+                        criteria=self.deriv_config.criteria,
+                    )
+                else:
+                    if self.weights_ is None:
+                        raise ValueError("Weights cannot be None...")
+                    t = time.time()
+                    deriv_estimates = penalized_locpol(
+                        fval,
+                        direction,
+                        X_work,
+                        self.weights_[j],
+                        degree=self._max_order + 1,
+                        pen=self.deriv_config.pen,
+                        penalize_intercept=self.deriv_config.penalize_intercept,
+                    )
+                    print(time.time() - t)
+                # Store results
+                for k in range(self._max_order + 1):
+                    if k == 0 and not self.deriv_config.smoothed_predictions:
+                        derivatives[k, :, j] = fval
+                    else:
+                        derivatives[k, :, j] = deriv_estimates[:, k]
+
             # Rotate derivatives back
-            if ll > 0:
-                for kk in range(1, self._max_order + 1):
-                    derivatives[kk] = derivatives[kk].dot(Vt)
+            if rotation > 0:
+                for k in range(1, self._max_order + 1):
+                    derivatives[k] = derivatives[k] @ Vt
 
-        # Collect output
-        self.derivatives_ = derivatives
+        return derivatives
 
-    # Compute oracle derivatives
-    def fit_derivatives_oracle(self, X, ff,
-                               no_xtra_features=None):
+    def fit_derivatives_oracle(
+        self, X: np.ndarray, ff: Callable, no_xtra_features: list | None = None
+    ) -> list[np.ndarray]:
+        """
+        Compute oracle (true) derivatives using automatic differentiation.
+
+        Args:
+            X: Feature matrix
+            ff: True function (must be JAX-differentiable)
+            no_xtra_features: Features to exclude
+
+        Returns:
+            List of [gradient_matrix, hessian_matrix]
+        """
         n, d = X.shape
+        xtra_features, _ = get_feature_indices(d, no_xtra_features)
+        d_xtra = len(xtra_features)
 
-        # Handle no_xtra_features
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-            d_xtra = len(xtra_features)
-        else:
-            d_xtra = d
-            xtra_features = list(range(d))
-            no_xtra_features = []
-
-        # Oracle only works up to order 2
         if self._max_order > 2:
-            raise ValueError("Oracle bounds can only be \
-            computed up to order 2.")
+            raise ValueError("Oracle bounds only supported up to order 2")
 
-        # Compute derivatives
-        self.derivatives_ = [None] * 2
         grad_mat = np.zeros((d_xtra, n))
         hessian_mat = np.zeros((d_xtra, d_xtra, n))
-        if self._max_order > 0:
-            for jj, var in enumerate(xtra_features):
-                print(jj)
-                vv = np.zeros((d, 1))
-                vv[var] = 1
-                grad_mat[jj, :] = Dv(ff, vv)(X)
-                if self._max_order > 1:
-                    for kk, var2 in enumerate(xtra_features[jj:]):
-                        zz = np.zeros((d, 1))
-                        zz[var2] = 1
-                        hessian_mat[jj, kk, :] = Dv(Dv(ff, vv), zz)(X)
-                        hessian_mat[kk, jj, :] = hessian_mat[jj, kk, :]
-            self.derivatives_[0] = grad_mat
-            if self._max_order > 1:
-                self.derivatives_[1] = hessian_mat
 
-    # Compute extrapolation bounds
-    def prediction_bounds(self, X, fval, x0,
-                          no_xtra_features=None, refit=False):
-        if len(x0.shape) == 1:
-            x0 = x0.reshape(-1, 1)
+        if self._max_order > 0:
+            for j, var in enumerate(xtra_features):
+                if self.verbose > 0:
+                    print(f"Computing oracle derivative for variable {j}")
+
+                direction = np.zeros((d, 1))
+                direction[var] = 1
+                grad_mat[j, :] = Dv(ff, direction)(X)
+
+                if self._max_order > 1:
+                    for k, var2 in enumerate(xtra_features[j:]):
+                        direction2 = np.zeros((d, 1))
+                        direction2[var2] = 1
+                        hessian_mat[j, k, :] = Dv(Dv(ff, direction), direction2)(X)
+                        hessian_mat[k, j, :] = hessian_mat[j, k, :]
+
+        return [grad_mat, hessian_mat]
+
+    # -------------------------------------------------------------------------
+    # Extrapolation Bounds Computation
+    # -------------------------------------------------------------------------
+
+    def prediction_bounds(
+        self,
+        X: np.ndarray,
+        fval: np.ndarray,
+        x0: np.ndarray,
+        no_xtra_features: list | None = None,
+        refit: bool = False,
+    ) -> np.ndarray:
+        """
+        Compute extrapolation bounds for test points.
+
+        Args:
+            X: Training features of shape (n, d)
+            fval: Function values of shape (n,)
+            x0: Test points of shape (n0, d)
+            no_xtra_features: Features to exclude from extrapolation
+            refit: Whether to refit derivatives
+
+        Returns:
+            Bounds array of shape (n0, n_orders, 3) where last dim is [lower, upper, middle]
+        """
+        assert x0.ndim == 2, "x0 is expected to be 2-dimensional"
         n, d = X.shape
         n0 = x0.shape[0]
         fval = fval.flatten()
 
-        # Handle no_xtra_features
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-        else:
-            xtra_features = list(range(d))
-            no_xtra_features = []
+        xtra_features, no_xtra_list = get_feature_indices(d, no_xtra_features)
 
-        # Check if derivatives and weights are already computed
-        if self.weights_ is None or refit:
-            if self.verbose_ > 0:
-                print("Fitting weights for local polynomial...")
-            self.fit_rfweights(X, fval, no_xtra_features)
+        # Fit derivatives if needed
         if self.derivatives_ is None or refit:
-            if self.verbose_ > 0:
+            if self.verbose > 0:
                 print("Fitting derivatives...")
-            self.fit_derivatives(X, fval,
-                                 no_xtra_features=no_xtra_features,
-                                 refit=refit)
+            self.derivatives_ = self.fit_derivatives(
+                X, fval, no_xtra_features=no_xtra_features, refit=refit
+            )
 
-        # Determine weighting for extrapolation points (using rotation)
-        mu = self.derivatives_[1].mean(axis=0)
-        U, D, Vt = np.linalg.svd(self.derivatives_[1]-mu[None, :])
-        TT = (Vt.T) * D[None, :]
-        Xtilde = X[:, xtra_features].dot(TT)
-        Xtilde = np.c_[Xtilde, X[:, no_xtra_features]]
-        x0tilde = x0[:, xtra_features].dot(TT)
-        x0tilde = np.c_[x0tilde, x0[:, no_xtra_features]]
-        if self.extra_params_['dist'] in ['rf', 'rfnn']:
-            self.fit_rfweights_predict(Xtilde, fval, x0tilde)
-            weight_x0 = self.predict_weights_
-            if self.extra_params_['dist'] == 'rfnn':
-                nn = self.extra_params_['nn']
-                for ii in range(n0):
-                    nn_max = np.min([np.sum(weight_x0[ii, :] > 0), nn])
-                    xinds = np.argsort(weight_x0[ii, :])[-nn_max:]
-                    weight_x0[ii, :] = 0
-                    weight_x0[ii, xinds] = 1/nn
-        elif self.extra_params_['dist'] == 'euclidean':
-            # find closest points between rotated points
-            weight_x0 = np.zeros((n0, n))
-            nn = self.extra_params_['nn']
-            for ii in range(n0):
-                xinds = np.argsort(
-                    np.sum((x0tilde[None, ii, :] - Xtilde)**2,
-                           axis=1))[:nn]
-                weight_x0[ii, xinds] = 1/nn
+        # Transform features for distance computation
+        TT = transform_features_by_gradient(self.derivatives_[1])
+        X_transformed = apply_feature_transform(X, TT, xtra_features, no_xtra_list)
+        x0_transformed = apply_feature_transform(x0, TT, xtra_features, no_xtra_list)
 
-        # Iterate over all extrapolation points and average/intersect
-        bounds = np.zeros((n0, len(self.orders_), 3))
-        for ll, xpt in enumerate(x0):
-            xinds = np.where(weight_x0[ll, :] != 0)[0]
-            if self.verbose_ > 2:
-                print(f'Number of anchor points to check: {len(xinds)}')
-            f_lower = np.zeros((len(xinds), len(self.orders_)))
-            f_upper = np.zeros((len(xinds), len(self.orders_)))
-            f_median = np.zeros((len(xinds), len(self.orders_)))
-            for ii, xind in enumerate(xinds):
-                xx = X[xind, :].reshape(1, -1)
-                vv = (xpt - xx)[:, xtra_features]
-                vv_norm = np.sqrt(np.sum(vv**2))
-                # Compute directional derivatives
-                deriv_mat = np.zeros((n, self._max_order+1))
-                deriv_mat[:, 0] = self.derivatives_[0, :, :].mean(axis=1)
-                if vv_norm > np.finfo(float).eps:
-                    vv_direction = np.array(vv/vv_norm).reshape(-1, 1)
-                    for kk in range(1, self._max_order + 1):
-                        deriv_mat[:, kk] = self.derivatives_[kk, :, :].dot(
-                            vv_direction**kk).flatten()
-                # Select bounds
-                deriv_min = np.quantile(deriv_mat,
-                                        self.extra_params_['alpha'],
-                                        axis=0)
-                deriv_max = np.quantile(deriv_mat,
-                                        1-self.extra_params_['alpha'],
-                                        axis=0)
-                deriv_median = np.quantile(deriv_mat, 0.5, axis=0)
+        if self.verbose > 1:
+            print("Computing anchor weights...")
 
-                # Debug output
-                if self.verbose_ > 3:
-                    print(xx)
-                    print(fval[xind].reshape(1, -1))
-                    print(deriv_mat[xind, :])
+        # Compute anchor weights
+        anchor_weights = compute_anchor_weights(
+            X_transformed, x0_transformed, fval, self.extra_config
+        )
+        self.predict_weights_ = anchor_weights
 
-                # Estimate extrapolation bounds
-                mterm = 0
-                kk = 0
-                for oo in range(0, self._max_order+1):
-                    if oo in self.orders_:
-                        lo_bdd = (deriv_min[oo]*(vv_norm**oo) /
-                                  math.factorial(oo))
-                        up_bdd = (deriv_max[oo]*(vv_norm**oo) /
-                                  math.factorial(oo))
-                        median_deriv = (deriv_median[oo]*(vv_norm**oo) /
-                                        math.factorial(oo))
-                        f_lower[ii, kk] = (mterm + lo_bdd)
-                        f_upper[ii, kk] = (mterm + up_bdd)
-                        f_median[ii, kk] = (mterm + median_deriv)
-                        kk += 1
-                    mterm += deriv_mat[xind, oo]*(
-                        vv_norm**oo)/math.factorial(oo)
+        # Pre-compute values used in inner loop
+        deriv_mean_0 = self.derivatives_[0].mean(axis=1)
+        factorials = self._factorials
+        max_order = self._max_order
+        orders = self.orders
+        n_orders = len(orders)
+        alpha = self.extra_config.alpha
+        quantile_levels = np.array([alpha, 1 - alpha])
 
-            # Combine bounds over xinds
-            ww = (weight_x0[ll, xinds]/np.sum(weight_x0[ll, :]))[:, None]
-            f_median = np.sum(f_median*ww, axis=0)
-            if self.extra_params_['aggregation'] == "average":
-                f_lower = np.sum(f_lower*ww, axis=0)
-                f_upper = np.sum(f_upper*ww, axis=0)
-            elif self.extra_params_['aggregation'] == "intersection":
-                f_lower = np.max(f_lower, axis=0)
-                f_upper = np.min(f_upper, axis=0)
-            elif self.extra_params_['aggregation'] == "tightest":
-                ind = np.argmin(f_upper - f_lower, axis=0)
-                f_lower = f_lower[ind, list(range(len(ind)))]
-                f_upper = f_upper[ind, list(range(len(ind)))]
-            elif self.extra_params_['aggregation'] == "quantile-intersection":
-                qt = self.extra_params_['beta']
-                f_lower = np.quantile(f_lower, 1-qt, axis=0)
-                f_upper = np.quantile(f_upper, qt, axis=0)
-            elif self.extra_params_['aggregation'] == "best":
-                f_upper.sort(axis=0)
-                f_lower[::-1].sort(axis=0)
-                ind = np.argmax((f_upper - f_lower) >= 0, axis=0)
-                f_lower = f_lower[ind, list(range(len(ind)))]
-                f_upper = f_upper[ind, list(range(len(ind)))]
-            elif self.extra_params_['aggregation'] == "optimal-average":
-                f_lower = np.max(f_lower, axis=0)
-                f_upper = np.min(f_upper, axis=0)
-                ind = f_upper < f_lower
-                average = (f_upper + f_lower)/2
-                f_lower[ind] = average[ind]
-                f_upper[ind] = average[ind]
+        # Pre-allocate arrays reused in inner loop
+        deriv_mat = np.zeros((n, max_order + 1))
 
-            # collect results
-            bounds[ll, :, 0] = f_lower
-            bounds[ll, :, 1] = f_upper
-            bounds[ll, :, 2] = f_median
+        # Compute bounds for each test point
+        bounds = np.zeros((n0, n_orders, 3))
 
-        # return results
-        return(bounds)
+        for i, xpt in enumerate(x0):
+            anchor_indices = np.where(anchor_weights[i, :] != 0)[0]
+            n_anchors = len(anchor_indices)
 
-    # Compute oracle extrapolation bounds
-    def prediction_bounds_oracle(self, X, ff, x0,
-                                 no_xtra_features=None, refit=False):
-        if len(x0.shape) == 1:
-            x0 = x0.reshape(-1, 1)
+            if self.verbose > 2:
+                print(f"Test point {i}: {n_anchors} anchor points")
+
+            f_lower = np.zeros((n_anchors, n_orders))
+            f_upper = np.zeros((n_anchors, n_orders))
+
+            for j, anchor_idx in enumerate(anchor_indices):
+                anchor_point = X[anchor_idx, :]
+
+                # Compute direction and distance to anchor
+                direction_vec = xpt[xtra_features] - anchor_point[xtra_features]
+                distance = np.sqrt(np.sum(direction_vec**2))
+
+                # Compute directional derivatives (reuse pre-allocated array)
+                deriv_mat[:, 0] = deriv_mean_0
+
+                if distance > np.finfo(float).eps:
+                    unit_direction = (direction_vec / distance).reshape(-1, 1)
+                    for k in range(1, max_order + 1):
+                        deriv_mat[:, k] = (
+                            self.derivatives_[k] @ (unit_direction**k)
+                        ).flatten()
+                else:
+                    deriv_mat[:, 1:] = 0
+
+                # Compute quantile bounds on derivatives (single call for all 3)
+                quantiles = np.quantile(deriv_mat, quantile_levels, axis=0)
+                deriv_min, deriv_max = (
+                    quantiles[0],
+                    quantiles[1],
+                )
+
+                # Pre-compute powers of distance
+                dist_powers = distance ** np.arange(max_order + 1)
+
+                # Compute Taylor expansion bounds
+                cumulative_term = 0.0
+                order_idx = 0
+
+                for oo in range(max_order + 1):
+                    if oo in orders:
+                        factor = dist_powers[oo] / factorials[oo]
+                        f_lower[j, order_idx] = cumulative_term + deriv_min[oo] * factor
+                        f_upper[j, order_idx] = cumulative_term + deriv_max[oo] * factor
+                        order_idx += 1
+
+                    cumulative_term += (
+                        deriv_mat[anchor_idx, oo] * dist_powers[oo] / factorials[oo]
+                    )
+
+            # Aggregate bounds
+            weights = anchor_weights[i, anchor_indices] / anchor_weights[i, :].sum()
+            weights = weights[:, None]
+
+            # Lower and upper depend on aggregation method
+            bounds[i, :, 0], bounds[i, :, 1], bounds[i, :, 2] = aggregate_bounds(
+                f_lower,
+                f_upper,
+                method=self.extra_config.aggregation,
+                weights=weights,
+                beta=self.extra_config.beta,
+            )
+
+        return bounds
+
+    def prediction_bounds_oracle(
+        self,
+        X: np.ndarray,
+        ff: Callable,
+        x0: np.ndarray,
+        no_xtra_features: list | None = None,
+        refit: bool = False,
+    ) -> np.ndarray:
+        """
+        Compute oracle extrapolation bounds using true derivatives.
+
+        Args:
+            X: Training features
+            ff: True function (JAX-differentiable)
+            x0: Test points
+            no_xtra_features: Features to exclude
+            refit: Whether to refit
+
+        Returns:
+            Bounds array of shape (n0, n_orders, 2) with [lower, upper]
+        """
+        x0 = np.atleast_2d(x0)
         n, d = X.shape
         n0 = x0.shape[0]
 
-        # Handle no_xtra_features
-        if no_xtra_features is not None:
-            xtra_features = [kk for kk in range(d)
-                             if kk not in no_xtra_features]
-        else:
-            xtra_features = list(range(d))
-            no_xtra_features = []
+        xtra_features, no_xtra_list = get_feature_indices(d, no_xtra_features)
 
-        # Oracle only works up to order 2
         if self._max_order > 2:
-            raise ValueError("Oracle bounds can only be \
-            computed up to order 2.")
+            raise ValueError("Oracle bounds only supported up to order 2")
 
-        # Compute derivatives
+        # Compute oracle derivatives
         if self.derivatives_ is None or refit:
-            if self.verbose_ > 0:
-                print("Fitting derivatives...")
-            self.fit_derivatives_oracle(X, ff)
+            if self.verbose > 0:
+                print("Fitting oracle derivatives...")
+            self.derivatives_ = self.fit_derivatives_oracle(X, ff, no_xtra_features)
+
         grad_mat = self.derivatives_[0]
         hessian_mat = self.derivatives_[1]
-
-        # Pre-evaluate function
         fval = ff(X).flatten()
 
-        # Determine weighting for extrapolation points (using rotation)
+        # Transform features
         mu = grad_mat.mean(axis=1)
-        U, D, Vt = np.linalg.svd((grad_mat.T)-mu[None, :])
-        TT = (Vt.T) * D[None, :]
-        Xtilde = X[:, xtra_features].dot(TT)
-        Xtilde = np.c_[Xtilde, X[:, no_xtra_features]]
-        x0tilde = x0[:, xtra_features].dot(TT)
-        x0tilde = np.c_[x0tilde, x0[:, no_xtra_features]]
-        if self.extra_params_['dist'] in ['rf', 'rfnn']:
-            self.fit_rfweights_predict(Xtilde, fval, x0tilde)
-            weight_x0 = self.predict_weights_
-            if self.extra_params_['dist'] == 'rfnn':
-                nn = self.extra_params_['nn']
-                for ii in range(n0):
-                    xinds = np.argsort(weight_x0[ii, :])[-nn:]
-                    weight_x0[ii, :] = 0
-                    weight_x0[ii, xinds] = 1/nn
-        elif self.extra_params_['dist'] == 'euclidean':
-            # find closest points between rotated points
-            weight_x0 = np.zeros((n0, n))
-            nn = self.extra_params_['nn']
-            for ii in range(n0):
-                xinds = np.argsort(
-                    np.sum((x0tilde[None, ii, :] - Xtilde)**2,
-                           axis=1))[:nn]
-                weight_x0[ii, xinds] = 1/nn
+        _, D, Vt = np.linalg.svd(grad_mat.T - mu[None, :])
+        TT = Vt.T * D[None, :]
 
-        # Iterate over all extrapolation points and average/intersect
-        bounds = np.zeros((n0, len(self.orders_), 2))
-        for ll, xpt in enumerate(x0):
-            xinds = np.where(weight_x0[ll, :] != 0)[0]
-            f_lower = np.zeros((len(xinds), len(self.orders_)))
-            f_upper = np.zeros((len(xinds), len(self.orders_)))
-            for ii, xind in enumerate(xinds):
-                xx = X[xind, :].reshape(1, -1)
-                vv = (xpt - xx)[:, xtra_features]
-                vv_norm = np.sqrt(np.sum(vv**2))
+        X_transformed = apply_feature_transform(X, TT, xtra_features, no_xtra_list)
+        x0_transformed = apply_feature_transform(x0, TT, xtra_features, no_xtra_list)
+
+        # Compute anchor weights
+        anchor_weights = compute_anchor_weights(
+            X_transformed, x0_transformed, fval, self.extra_config
+        )
+        self.predict_weights_ = anchor_weights
+
+        # Pre-compute values
+        factorials = self._factorials
+        max_order = self._max_order
+        orders = self.orders
+        n_orders = len(orders)
+        alpha = self.extra_config.alpha
+
+        # Compute bounds
+        bounds = np.zeros((n0, n_orders, 2))
+
+        for i, xpt in enumerate(x0):
+            anchor_indices = np.where(anchor_weights[i, :] != 0)[0]
+            f_lower = np.zeros((len(anchor_indices), n_orders))
+            f_upper = np.zeros((len(anchor_indices), n_orders))
+
+            for j, anchor_idx in enumerate(anchor_indices):
+                anchor_point = X[anchor_idx, :]
+                direction_vec = xpt[xtra_features] - anchor_point[xtra_features]
+                distance = np.sqrt(np.sum(direction_vec**2))
+
                 # Compute directional derivatives
-                if vv_norm < np.finfo(float).eps:
-                    deriv_mat = np.zeros((n, self._max_order+1))
-                    deriv_mat[:, 0] = fval
+                deriv_mat = np.zeros((n, max_order + 1))
+                deriv_mat[:, 0] = fval
+
+                if distance > np.finfo(float).eps:
+                    unit_dir = (direction_vec / distance).reshape(1, -1)
+                    if max_order >= 1:
+                        deriv_mat[:, 1] = (unit_dir @ grad_mat).flatten()
+                    if max_order >= 2:
+                        deriv_mat[:, 2] = (
+                            unit_dir @ (unit_dir @ hessian_mat)[0]
+                        ).flatten()
+
+                # Compute bounds (single quantile call)
+                quantiles = np.quantile(deriv_mat, [alpha, 1 - alpha], axis=0)
+                deriv_min, deriv_max = quantiles[0], quantiles[1]
+
+                # Pre-compute powers
+                dist_powers = distance ** np.arange(max_order + 1)
+
+                cumulative_term = 0.0
+                order_idx = 0
+
+                for order in range(max_order + 1):
+                    if order in orders:
+                        factor = dist_powers[order] / factorials[order]
+                        f_lower[j, order_idx] = (
+                            cumulative_term + deriv_min[order] * factor
+                        )
+                        f_upper[j, order_idx] = (
+                            cumulative_term + deriv_max[order] * factor
+                        )
+                        order_idx += 1
+
+                    cumulative_term += (
+                        deriv_mat[anchor_idx, order]
+                        * dist_powers[order]
+                        / factorials[order]
+                    )
+
+            # Aggregate bounds
+            weights = anchor_weights[i, anchor_indices] / anchor_weights[i, :].sum()
+            bounds[i, :, 0], bounds[i, :, 1], _ = aggregate_bounds(
+                f_lower,
+                f_upper,
+                method=self.extra_config.aggregation,
+                weights=weights[:, None],
+                beta=self.extra_config.beta,
+            )
+
+        return bounds
+
+    # -------------------------------------------------------------------------
+    # Parameter Tuning
+    # -------------------------------------------------------------------------
+
+    def parameter_tuning(
+        self,
+        X: np.ndarray,
+        fval: np.ndarray,
+        Y: np.ndarray,
+        no_xtra_features: list | None = None,
+        rf_pars_list: list | None = None,
+        pen_list: list | None = None,
+        loss: Literal["mse", "quantile"] = "mse",
+        q: float = 0.9,
+        tol: float = 3.0,
+    ) -> tuple[dict, float]:
+        """
+        Tune hyperparameters using cross-validation.
+
+        Args:
+            X: Features
+            fval: Estimated function values
+            Y: True response values
+            no_xtra_features: Features to exclude
+            rf_pars_list: List of RF parameter dicts to try
+            pen_list: List of penalty values to try
+            loss: Loss function ("mse" or "quantile")
+            q: Quantile for quantile loss
+            tol: Tolerance for one-standard-error rule
+
+        Returns:
+            Tuple of (optimal_rf_pars, optimal_penalty)
+        """
+        n, d = X.shape
+        eps = np.finfo(float).eps
+
+        rf_pars_list = rf_pars_list or [self.deriv_config.rf_pars]
+        if self.deriv_config.no_locpol:
+            pen_list = [0]
+        else:
+            pen_list = pen_list or [self.deriv_config.pen]
+
+        xtra_features, no_xtra_list = get_feature_indices(d, no_xtra_features)
+        d_xtra = len(xtra_features)
+
+        if len(rf_pars_list) == 1 and len(pen_list) == 1:
+            self.deriv_config.rf_pars = rf_pars_list[0]
+            self.deriv_config.pen = pen_list[0]
+            return rf_pars_list[0], pen_list[0]
+
+        # Cross-validation
+        kf = KFold(n_splits=5, shuffle=True)
+        err_mat = np.zeros((n, len(rf_pars_list), len(pen_list)))
+
+        # Accumulate predictions across folds
+        fhat_mat = np.zeros((n, len(rf_pars_list), len(pen_list)))
+        degree = self._max_order + 1
+        X_work = X[:, xtra_features]
+
+        for kk, (train_idx, test_idx) in enumerate(kf.split(X)):
+            print(f"CV split {kk}...")
+            for i, rf_pars in enumerate(rf_pars_list):
+                self.deriv_config.rf_pars = rf_pars
+
+                if self.deriv_config.no_locpol:
+                    for jj in range(d_xtra):
+                        new_order = [jj] + [k for k in range(d_xtra) if k != jj]
+                        X_full = np.c_[X_work[:, new_order], X[:, no_xtra_list]]
+                        fhat_mat[test_idx, i, 0] += (
+                            fit_derivatives_adaXT(
+                                X_full[train_idx, :],
+                                fval[train_idx],
+                                X_full[test_idx, :],
+                                rf_pars=rf_pars,
+                                num_trees=self.deriv_config.num_trees,
+                                criteria=self.deriv_config.criteria,
+                            )[:, 0]
+                            / d_xtra
+                        )
                 else:
-                    vv_direction = np.array(vv/vv_norm).reshape(1, -1)
-                    deriv_mat = np.zeros((n, self._max_order+1))
-                    for order in range(self._max_order+1):
-                        if order == 0:
-                            deriv_mat[:, order] = fval
-                        elif order == 1:
-                            deriv_mat[:, order] = vv_direction.dot(
-                                grad_mat).flatten()
-                        elif order == 2:
-                            deriv_mat[:, order] = (vv_direction).dot(
-                                vv_direction.dot(hessian_mat)[0]).flatten()
-                # Select bounds
-                deriv_min = np.quantile(deriv_mat,
-                                        self.extra_params_['alpha'], axis=0)
-                deriv_max = np.quantile(deriv_mat,
-                                        1-self.extra_params_['alpha'], axis=0)
+                    # Process one feature at a time to reduce peak memory
+                    # Pre-extract training data slices to avoid repeated indexing
+                    X_train = X[train_idx, :]
+                    fval_train = fval[train_idx]
+                    X_test = X[test_idx, :]
 
-                # Debug output
-                if self.verbose_ > 3:
-                    print(xx)
-                    print(ff(xx.reshape(1, -1)))
-                    print(deriv_mat[xind, :])
-                    print(deriv_min)
-                    print(deriv_max)
-                    print(vv_direction)
+                    for var in xtra_features:
+                        # Fit weights for single feature
+                        var_order = np.array([var] + [k for k in range(d) if k != var])
 
-                # Compute extrapolation bounds
-                mterm = 0
-                kk = 0
-                for oo in range(0, self._max_order+1):
-                    if oo in self.orders_:
-                        lo_bdd = (deriv_min[oo]*(vv_norm**oo) /
-                                  math.factorial(oo))
-                        up_bdd = (deriv_max[oo]*(vv_norm**oo) /
-                                  math.factorial(oo))
-                        f_lower[ii, kk] = (mterm + lo_bdd)
-                        f_upper[ii, kk] = (mterm + up_bdd)
-                        kk += 1
-                    mterm += deriv_mat[xind, oo]*(
-                        vv_norm**oo)/math.factorial(oo)
+                        # Pass list of [train, test] to avoid creating full (n, n_train) matrix
+                        weights = rf_weights_adaXT(
+                            X_train[:, var_order],
+                            fval_train,
+                            Xeval=X[:, var_order],
+                            rf_pars=rf_pars,
+                            num_trees=self.deriv_config.num_trees,
+                            criteria=self.deriv_config.criteria,
+                            batch_size=2000,
+                        )
 
-            # Combine bounds over xinds
-            if self.extra_params_['aggregation'] == "average":
-                ww = (weight_x0[ll, xinds]/np.sum(weight_x0[ll, :]))[:, None]
-                f_lower = np.sum(f_lower*ww, axis=0)
-                f_upper = np.sum(f_upper*ww, axis=0)
-            elif self.extra_params_['aggregation'] == "intersection":
-                f_lower = np.max(f_lower, axis=0)
-                f_upper = np.min(f_upper, axis=0)
-            elif self.extra_params_['aggregation'] == "tightest":
-                ind = np.argmin(f_upper - f_lower, axis=0)
-                f_lower = f_lower[ind, list(range(len(ind)))]
-                f_upper = f_upper[ind, list(range(len(ind)))]
-            elif self.extra_params_['aggregation'] == "quantile-intersection":
-                qt = self.extra_params_['beta']
-                f_lower = np.quantile(f_lower, 1-qt, axis=0)
-                f_upper = np.quantile(f_upper, qt, axis=0)
-            elif self.extra_params_['aggregation'] == "best":
-                f_upper.sort(axis=0)
-                f_lower[::-1].sort(axis=0)
-                ind = np.argmax((f_upper - f_lower) >= 0, axis=0)
-                f_lower = f_lower[ind, list(range(len(ind)))]
-                f_upper = f_upper[ind, list(range(len(ind)))]
-            elif self.extra_params_['aggregation'] == "optimal-average":
-                f_lower = np.max(f_lower, axis=0)
-                f_upper = np.min(f_upper, axis=0)
-                ind = f_upper < f_lower
-                average = (f_upper + f_lower)/2
-                f_lower[ind] = average[ind]
-                f_upper[ind] = average[ind]
+                        # Extract weight matrices from list
+                        weights_train = weights[train_idx, :]
+                        weights_test = weights[test_idx, :]
 
-            # collect results
-            bounds[ll, :, 0] = f_lower
-            bounds[ll, :, 1] = f_upper
+                        direction = np.zeros((d, 1))
+                        direction[var] = 1
 
-        # return results
-        return(bounds)
+                        for j, pen in enumerate(pen_list):
+                            print("Fitting locpol")
+                            deriv_mat = penalized_locpol(
+                                fval_train,
+                                direction,
+                                X_train,
+                                weights_train,
+                                degree=degree,
+                                pen=pen,
+                                penalize_intercept=self.deriv_config.penalize_intercept,
+                            )
+                            coefs = deriv_mat / np.array(
+                                [math.factorial(k) for k in range(degree + 1)]
+                            )
+                            fhat_mat[test_idx, i, j] += (
+                                locpol_predict(
+                                    coefs,
+                                    weights_test,
+                                    X_train,
+                                    X_test,
+                                    direction,
+                                    degree,
+                                )
+                                / d_xtra
+                            )
+
+        # Compute errors for all parameter combinations
+        for i in range(len(rf_pars_list)):
+            for j in range(len(pen_list)):
+                fhat = fhat_mat[:, i, j]
+                if loss == "quantile":
+                    err_mat[:, i, j] = q * np.abs(fhat - Y) * (Y > fhat) + (
+                        1 - q
+                    ) * np.abs(fhat - Y) * (Y <= fhat)
+                else:
+                    err_mat[:, i, j] = (fhat - Y) ** 2
+
+        # Select optimal parameters using one-standard-error rule
+        mean_mat = err_mat.mean(axis=0)
+        min_idx = np.unravel_index(mean_mat.argmin(), mean_mat.shape)
+
+        var_mat = np.var(
+            err_mat - err_mat[:, min_idx[0], min_idx[1]][:, None, None], axis=0
+        )
+        se_mat = np.sqrt(var_mat) / np.sqrt(n)
+
+        # Find most regularized params within tolerance
+        valid = mean_mat <= mean_mat[min_idx] + tol * se_mat + eps
+        valid_idx = np.where(valid)
+
+        opt_rf_idx = valid_idx[0].min()
+        opt_pen_idx = valid_idx[1][valid_idx[0] == opt_rf_idx].min()
+
+        opt_rf_pars = rf_pars_list[opt_rf_idx]
+        opt_pen = pen_list[opt_pen_idx]
+
+        if self.verbose > 0:
+            print(f"Mean errors:\n{mean_mat}")
+            print(f"Standard errors:\n{se_mat}")
+            print(f"Selected: rf_pars={opt_rf_pars}, pen={opt_pen}")
+
+        self.deriv_config.rf_pars = opt_rf_pars
+        self.deriv_config.pen = opt_pen
+
+        return opt_rf_pars, opt_pen
